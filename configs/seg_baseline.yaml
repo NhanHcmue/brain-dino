@@ -1,0 +1,43 @@
+# ============================================================
+# Config: Segmentation — Baseline (Random Init)
+# ⚠ Mọi thứ giống seg_pretrained.yaml trừ encoder_path + output dir
+# ============================================================
+
+# ── Data ──
+data:
+  patch_dir:  "data/brats_patches"
+  ram_cache:  false
+
+# ── Không có pretrained encoder ──
+pretrain:
+  encoder_path: null
+
+# ── Output ──
+output:
+  dir:        "outputs/seg_baseline"
+  checkpoint: "outputs/seg_baseline/checkpoint.pth"
+  best_model: "outputs/seg_baseline/best_model.pth"
+
+# ── Training (PHẢI GIỐNG pretrained) ──
+train:
+  batch_size:  2
+  num_epochs:  200
+  num_workers: 8
+  seed:        42     # ⚠ cùng seed = cùng data split = fair comparison
+  grad_accum:  4
+
+# ── Không freeze (không có encoder tốt để preserve) ──
+# finetune: không có
+
+# ── Optimizer (GIỐNG pretrained) ──
+optimizer:
+  lr:           2.0e-4
+  weight_decay: 1.0e-4
+
+# ── GPU Augmentation (GIỐNG pretrained) ──
+augmentation:
+  p_flip:      0.5
+  p_noise:     0.5
+  p_crop:      0.5
+  p_cutout:    0.4
+  p_intensity: 0.8

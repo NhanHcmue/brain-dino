@@ -1,0 +1,56 @@
+# ============================================================
+# Config: DINO Pretraining — ConvNeXt-Tiny 3D
+# ============================================================
+#
+# GPU Guide:
+#  GPU         VRAM   batch  workers  n_local  grad_accum
+#  T4 (Colab)  16GB     4      4        2          4
+#  L4          24GB     8      8        4          2
+#  RTX3090     24GB     8      8        4          2
+#  A100-40G    40GB    16      8        6          1
+#
+# Tổng effective batch = batch × grad_accum
+# DINO ổn với effective batch = 16-32
+
+# ── Data ──
+data:
+  patch_dir:  "data/brats_patches"
+  ram_cache:  false   # true nếu RAM >= 64GB
+
+# ── Output ──
+output:
+  dir:          "outputs/dino"
+  checkpoint:   "outputs/dino/checkpoint.pth"
+  best_encoder: "outputs/dino/best_encoder.pth"   # ← input cho train_seg.py
+
+# ── Training ──
+train:
+  batch_size:   4      # ← CHỈNH THEO GPU (xem bảng trên)
+  num_epochs:   150    # 100 là đủ, 150 nếu có thời gian
+  num_workers:  8      # = nproc ÷ 2
+  seed:         42
+  grad_accum:   4      # effective batch = 4×4 = 16
+  warmup_epochs: 10
+
+# ── Optimizer ──
+optimizer:
+  base_lr:      1.5e-4   # được scale theo batch: base_lr × batch/256
+  min_lr:       1.0e-6
+  weight_decay: 0.05     # DINO dùng weight_decay cao hơn supervised
+
+# ── DINO hyperparameters ──
+dino:
+  out_dim:       65536      # số classes prototype (lớn = rich representation)
+  momentum:      0.996      # EMA momentum cho teacher (tăng theo epoch)
+  center_momentum: 0.9      # momentum cho center estimate
+  
+  # Multi-crop
+  global_scale: [0.85, 1.0]   # 2 global crops: 85-100% patch size
+  local_scale:  [0.40, 0.60]  # n local crops: 40-60% patch size
+  n_local_crops: 4             # giảm xuống 2 nếu OOM
+  
+  # Temperature
+  student_temp:  0.1    # sharp distribution cho student
+  teacher_temp:  0.04   # sharper cho teacher (càng sharp càng stable)
+  warmup_teacher_temp:        0.04
+  warmup_teacher_temp_epochs: 30   # warmup teacher temp từ 0.04 → 0.04

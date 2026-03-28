@@ -1,0 +1,51 @@
+# ============================================================
+# Config: Segmentation — DINO Pretrained Encoder
+# ============================================================
+#
+# GPU Guide:
+#  GPU         VRAM   batch  workers  grad_accum  freeze_ep
+#  T4 (Colab)  16GB     2      4         4           20
+#  L4          24GB     4      8         2           20
+#  RTX3090     24GB     4      8         2           20
+#  A100-40G    40GB     8      8         1           20
+
+# ── Data ──
+data:
+  patch_dir:  "data/brats_patches"
+  ram_cache:  false
+
+# ── Pretrained encoder từ train_dino.py ──
+pretrain:
+  encoder_path: "outputs/dino/best_encoder.pth"
+
+# ── Output ──
+output:
+  dir:        "outputs/seg_pretrained"
+  checkpoint: "outputs/seg_pretrained/checkpoint.pth"
+  best_model: "outputs/seg_pretrained/best_model.pth"
+
+# ── Training ──
+train:
+  batch_size:  2      # ← CHỈNH THEO GPU (ConvNeXt nặng hơn ResNet50)
+  num_epochs:  200    # nhiều epoch hơn vì fine-tune cần thời gian
+  num_workers: 8
+  seed:        42     # ⚠ PHẢI GIỐNG baseline để cùng train/val split
+  grad_accum:  4      # effective batch = 8
+
+# ── Fine-tuning strategy ──
+finetune:
+  freeze_encoder_epochs: 20    # freeze encoder 20 epochs đầu
+  encoder_lr_scale:      0.01  # sau đó train encoder với lr × 0.01
+
+# ── Optimizer ──
+optimizer:
+  lr:           2.0e-4
+  weight_decay: 1.0e-4
+
+# ── GPU Augmentation ──
+augmentation:
+  p_flip:      0.5
+  p_noise:     0.5
+  p_crop:      0.5
+  p_cutout:    0.4
+  p_intensity: 0.8
