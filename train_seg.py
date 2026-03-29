@@ -1,14 +1,10 @@
 """
-train_seg.py — Segmentation Training (Pretrained DINO + Baseline)
+train_dino.py — DINO Self-Supervised Pretraining
 
 Usage:
-    python train_seg.py --config configs/seg_pretrained.yaml
-    python train_seg.py --config configs/seg_baseline.yaml
-    python train_seg.py --config configs/seg_pretrained.yaml --batch 4 --workers 4
+    python train_dino.py --config configs/dino.yaml
 
-Training strategy (pretrained):
-    Phase 1 (epoch 0–19)  : Freeze encoder, chỉ train decoder
-    Phase 2 (epoch 20+)   : Unfreeze encoder, lr_encoder = lr × 0.01
+Output: outputs/dino/best_encoder.pth  ← dùng cho train_seg.py
 """
 
 import argparse
@@ -27,11 +23,10 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.augmentation import GPUAugmentation3D
+from src.augmentation import DINOMultiCrop3D
 from src.dataset      import BraTSLazyDataset, PatchDataset
+from src.dino         import DINO, DINOLoss
 from src.encoder      import ConvNeXtTiny3D
-from src.losses       import CombinedSegLoss, dice_score
-from src.models       import ConvNeXtNNUNet
 
 
 def set_seed(s):
@@ -45,58 +40,33 @@ def load_cfg(path):
         return yaml.safe_load(f)
 
 
-def gpu_mem():
-    if torch.cuda.is_available():
-        u = torch.cuda.memory_allocated() / 1e9
-        t = torch.cuda.get_device_properties(0).total_memory / 1e9
-        return f"{u:.1f}/{t:.0f}GB"
-    return "N/A"
-
-
 def log_system():
     print(f"PyTorch : {torch.__version__}")
     if torch.cuda.is_available():
         p = torch.cuda.get_device_properties(0)
         print(f"GPU     : {p.name}  ({p.total_memory/1e9:.1f} GB)")
+        print(f"CUDA    : {torch.version.cuda}")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32       = True
-        print(f"TF32    : enabled")
     else:
         print("GPU     : ✗ No CUDA!")
     print()
 
 
-def make_optimizer(model, lr, wd, encoder_path, enc_lr_scale):
-    if encoder_path:
-        enc_params = [p for n, p in model.named_parameters()
-                      if 'encoder' in n and p.requires_grad]
-        dec_params = [p for n, p in model.named_parameters()
-                      if 'encoder' not in n and p.requires_grad]
-        return optim.AdamW([
-            {'params': enc_params, 'lr': lr * enc_lr_scale},
-            {'params': dec_params, 'lr': lr},
-        ], weight_decay=wd)
-    return optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=lr, weight_decay=wd,
-    )
+def cosine_scheduler(base_val, final_val, epochs, warmup=10):
+    schedule = np.ones(epochs) * base_val
+    if warmup > 0:
+        schedule[:warmup] = np.linspace(0, base_val, warmup)
+    t = np.arange(epochs - warmup)
+    schedule[warmup:] = final_val + 0.5 * (base_val - final_val) * \
+                        (1 + np.cos(np.pi * t / (epochs - warmup)))
+    return schedule
 
 
-def cosine_lr(optimizer, epoch, num_epochs, warmup=5, base_lr=2e-4, min_lr=1e-6):
-    if epoch < warmup:
-        factor = (epoch + 1) / warmup
-    else:
-        factor = min_lr / base_lr + 0.5 * (1 - min_lr / base_lr) * \
-                 (1 + np.cos(np.pi * (epoch - warmup) / (num_epochs - warmup)))
-    for g in optimizer.param_groups:
-        g['lr'] = g.get('initial_lr', base_lr) * factor
-
-
-def build_datasets(cfg):
+def build_dataset(cfg):
     """
-    Trả về (train_ds, val_ds).
-    Ưu tiên BraTSLazyDataset nếu cfg.data.data_dir tồn tại,
-    fallback về PatchDataset nếu chỉ có patch_dir.
+    Trả về dataset train cho DINO (mode='ssl').
+    Ưu tiên BraTSLazyDataset nếu có data_dir, fallback về PatchDataset.
     """
     d          = cfg['data']
     data_dir   = d.get('data_dir')
@@ -106,55 +76,22 @@ def build_datasets(cfg):
     patch_size = d.get('patch_size', 128)
 
     if data_dir and os.path.isdir(data_dir):
-        # ── Lazy NII loader ──────────────────────────────────
-        train_ds = BraTSLazyDataset(
+        return BraTSLazyDataset(
             data_dir   = data_dir,
             split      = 'train',
             n_patches  = n_patches,
             patch_size = patch_size,
             cache_size = cache_size,
-            mode       = 'seg',
-        )
-        val_ds = BraTSLazyDataset(
-            data_dir   = data_dir,
-            split      = 'val',
-            n_patches  = d.get('n_patches_val', 16),
-            patch_size = patch_size,
-            cache_size = max(20, cache_size // 4),
-            mode       = 'seg',
+            mode       = 'ssl',
         )
     elif patch_dir and os.path.isdir(patch_dir):
-        # ── Legacy NPY loader ────────────────────────────────
-        ram_cache = d.get('ram_cache', False)
-        train_ds  = PatchDataset(patch_dir, 'train', mode='seg', ram_cache=ram_cache)
-        val_ds    = PatchDataset(patch_dir, 'val',   mode='seg', ram_cache=False)
+        return PatchDataset(patch_dir, split='train', mode='ssl',
+                            ram_cache=d.get('ram_cache', False))
     else:
         raise ValueError(
             "Config thiếu data source!\n"
-            "  Thêm 'data_dir' (đường dẫn NII) hoặc 'patch_dir' (NPY đã preprocess) vào config."
+            "  Thêm 'data_dir' hoặc 'patch_dir' vào configs/dino.yaml"
         )
-
-    return train_ds, val_ds
-
-
-def plot_and_save(history, label, out_dir):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    ax1.plot(history['train_loss'], label='Train', color='steelblue')
-    ax1.plot(history['val_loss'],   label='Val',   color='coral')
-    ax1.set_title('Loss'); ax1.legend(); ax1.grid(True, alpha=0.4)
-
-    ax2.plot(history['val_dice'], color='green', linewidth=2)
-    ax2.axhline(0.90, color='red',    linestyle='--', alpha=0.7, label='0.90')
-    ax2.axhline(0.85, color='orange', linestyle='--', alpha=0.7, label='0.85')
-    ax2.set_title('Val Dice'); ax2.legend(); ax2.grid(True, alpha=0.4)
-    ax2.set_ylim(0, 1)
-
-    plt.suptitle(f'UNet {label}'); plt.tight_layout()
-    path = os.path.join(out_dir, 'training_history.png')
-    plt.savefig(path, dpi=150); plt.close(fig)
-    print(f"✓ Plot → {path}")
-    if history['val_dice']:
-        print(f"  Best Dice: {max(history['val_dice']):.4f}")
 
 
 def train(cfg):
@@ -165,202 +102,174 @@ def train(cfg):
     log_system()
     set_seed(cfg['train']['seed'])
 
-    encoder_path = cfg['pretrain'].get('encoder_path')
-    label        = 'DINO-Pretrained' if encoder_path else 'Baseline'
-    print(f"Mode: {label}\n")
-
     # ── Dataset ──────────────────────────────────────────────
     nw = cfg['train']['num_workers']
     bs = cfg['train']['batch_size']
 
-    train_ds, val_ds = build_datasets(cfg)
-
-    train_loader = DataLoader(
-        train_ds, bs, shuffle=True,
+    dataset = build_dataset(cfg)
+    loader  = DataLoader(
+        dataset, batch_size=bs, shuffle=True,
         num_workers=nw, pin_memory=True, drop_last=True,
         persistent_workers=nw > 0,
         prefetch_factor=2 if nw > 0 else None,
     )
-    val_loader = DataLoader(
-        val_ds, bs, shuffle=False,
-        num_workers=max(1, nw // 2), pin_memory=True,
-        persistent_workers=nw > 0,
-        prefetch_factor=2 if nw > 0 else None,
-    )
-    print(f"Train: {len(train_ds)} patches | Val: {len(val_ds)} patches")
-    print(f"Loaders: {len(train_loader)} train | {len(val_loader)} val\n")
+    print(f"Dataset : {len(dataset)} patches | {len(loader)} batches/epoch\n")
 
     # ── Model ────────────────────────────────────────────────
-    encoder = ConvNeXtTiny3D(in_channels=4).to(DEVICE)
+    encoder    = ConvNeXtTiny3D(in_channels=4).to(DEVICE)
+    model      = DINO(encoder, feat_dim=768,
+                      out_dim=cfg['dino']['out_dim'],
+                      momentum=cfg['dino']['momentum']).to(DEVICE)
+    multi_crop = DINOMultiCrop3D(
+        global_scale=tuple(cfg['dino']['global_scale']),
+        local_scale=tuple(cfg['dino']['local_scale']),
+        n_local=cfg['dino']['n_local_crops'],
+    ).to(DEVICE)
+    criterion  = DINOLoss(
+        out_dim=cfg['dino']['out_dim'],
+        n_global_crops=2,
+        warmup_teacher_temp=cfg['dino']['warmup_teacher_temp'],
+        teacher_temp=cfg['dino']['teacher_temp'],
+        warmup_teacher_temp_epochs=cfg['dino']['warmup_teacher_temp_epochs'],
+        student_temp=cfg['dino']['student_temp'],
+        center_momentum=cfg['dino']['center_momentum'],
+    ).to(DEVICE)
 
-    if encoder_path:
-        assert os.path.exists(encoder_path), f"Encoder not found: {encoder_path}"
-        state = torch.load(encoder_path, map_location=DEVICE, weights_only=True)
-        missing, unexpected = encoder.load_state_dict(state, strict=False)
-        print(f"✓ Loaded DINO encoder: {encoder_path}")
-        if missing:    print(f"  Missing keys  : {len(missing)}")
-        if unexpected: print(f"  Unexpected keys: {len(unexpected)}")
-    else:
-        print("[BASELINE] Random init encoder")
+    n_params = sum(p.numel() for p in model.student_encoder.parameters())
+    print(f"Encoder : {n_params/1e6:.1f}M params")
 
-    model = ConvNeXtNNUNet(encoder, num_classes=1).to(DEVICE)
+    # ── Optimizer ────────────────────────────────────────────
+    num_epochs = cfg['train']['num_epochs']
+    warmup_ep  = cfg['train'].get('warmup_epochs', 10)
+    base_lr    = cfg['optimizer']['base_lr'] * bs / 256
+    min_lr     = cfg['optimizer']['min_lr']
+    wd         = cfg['optimizer']['weight_decay']
 
-    if hasattr(torch, 'compile') and torch.cuda.is_available():
-        try:
-            model = torch.compile(model, mode='reduce-overhead')
-            print("✓ torch.compile enabled")
-        except Exception:
-            pass
+    decay_params    = [p for n, p in model.named_parameters()
+                       if 'norm' not in n and 'bias' not in n
+                       and 'gamma' not in n and p.requires_grad]
+    no_decay_params = [p for n, p in model.named_parameters()
+                       if ('norm' in n or 'bias' in n or 'gamma' in n)
+                       and p.requires_grad]
 
-    total = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Model: {total:.1f}M params | GPU: {gpu_mem()}\n")
+    optimizer = optim.AdamW([
+        {'params': decay_params,    'weight_decay': wd},
+        {'params': no_decay_params, 'weight_decay': 0.0},
+    ], lr=base_lr)
 
-    # ── Training setup ───────────────────────────────────────
-    gpu_aug    = GPUAugmentation3D(**cfg['augmentation']).to(DEVICE)
-    criterion  = CombinedSegLoss()
+    lr_schedule  = cosine_scheduler(base_lr, min_lr, num_epochs, warmup_ep)
+    mom_schedule = cosine_scheduler(cfg['dino']['momentum'], 1.0, num_epochs, warmup=0)
+
     scaler     = GradScaler('cuda')
     grad_accum = cfg['train'].get('grad_accum', 1)
-    num_epochs = cfg['train']['num_epochs']
-    base_lr    = cfg['optimizer']['lr']
-    wd         = cfg['optimizer']['weight_decay']
-    freeze_ep  = cfg.get('finetune', {}).get('freeze_encoder_epochs', 0) if encoder_path else 0
-    enc_scale  = cfg.get('finetune', {}).get('encoder_lr_scale', 0.01)  if encoder_path else 1.0
-
-    if freeze_ep > 0:
-        for p in model.encoder.parameters():
-            p.requires_grad = False
-        print(f"Phase 1: encoder frozen for {freeze_ep} epochs\n")
-
-    optimizer = make_optimizer(model, base_lr, wd, encoder_path, enc_scale)
-    for g in optimizer.param_groups:
-        g['initial_lr'] = g['lr']
 
     # ── Resume ───────────────────────────────────────────────
-    start_epoch = 0; best_dice = 0.0
+    start_epoch = 0; best_loss = float('inf'); history = []
     ckpt_path   = cfg['output']['checkpoint']
     if os.path.exists(ckpt_path):
+        print(f'Resuming from {ckpt_path}')
         ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
         start_epoch = ckpt['epoch'] + 1
-        best_dice   = ckpt.get('best_dice', 0.0)
-        print(f"Resumed epoch {start_epoch}, best_dice={best_dice:.4f}\n")
+        best_loss   = ckpt.get('best_loss', float('inf'))
+        history     = ckpt.get('history', [])
+        print(f"  epoch={start_epoch}, best_loss={best_loss:.4f}\n")
 
-    history = {'train_loss': [], 'val_loss': [], 'val_dice': []}
-
-    print(f"{'─'*60}")
-    print(f"  Segmentation [{label}] — {num_epochs} epochs")
-    print(f"  batch={bs} | grad_accum={grad_accum} | effective={bs*grad_accum}")
-    print(f"{'─'*60}\n")
+    print(f"{'─'*55}")
+    print(f"  DINO Pretraining — {num_epochs} epochs")
+    print(f"  batch={bs} | lr={base_lr:.2e} | momentum={cfg['dino']['momentum']}")
+    print(f"{'─'*55}\n")
 
     for epoch in range(start_epoch, num_epochs):
+        for g in optimizer.param_groups:
+            g['lr'] = lr_schedule[epoch]
+        model.momentum = mom_schedule[epoch]
 
-        # Phase 2: unfreeze encoder
-        if epoch == freeze_ep and freeze_ep > 0:
-            for p in model.encoder.parameters():
-                p.requires_grad = True
-            optimizer = make_optimizer(model, base_lr, wd, encoder_path, enc_scale)
-            for g in optimizer.param_groups:
-                g['initial_lr'] = g['lr']
-            print(f"\n[Phase 2] Encoder unfrozen at epoch {epoch+1}\n")
-
-        cosine_lr(optimizer, epoch, num_epochs, warmup=5, base_lr=base_lr, min_lr=1e-6)
-
-        # ── Train ────────────────────────────────────────────
         model.train()
-        tr_loss = 0.0
+        ep_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        pbar = tqdm(
-            train_loader,
-            desc=f"[{label[:4]}] Ep {epoch+1:3d}/{num_epochs}",
-            ncols=90, leave=True,
-        )
+        pbar = tqdm(loader, desc=f"DINO Ep {epoch+1:3d}/{num_epochs}",
+                    ncols=90, leave=True)
 
-        for step, (img, seg) in enumerate(pbar):
-            img = img.to(DEVICE, non_blocking=True)
-            seg = seg.to(DEVICE, non_blocking=True)
+        for step, x in enumerate(pbar):
+            x = x.to(DEVICE, non_blocking=True)
 
             with torch.no_grad():
-                img = gpu_aug(img)
+                views = multi_crop(x)
 
             with autocast('cuda'):
-                out  = model(img)
-                loss = criterion(out, seg) / grad_accum
+                student_out, teacher_out = model(views)
+                loss = criterion(student_out, teacher_out, epoch) / grad_accum
 
             if not torch.isfinite(loss):
-                print(f"\n⚠ NaN loss ở step {step}")
+                print(f"\n⚠ NaN/Inf loss ở step {step}, skip")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
             scaler.scale(loss).backward()
 
-            if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
+            if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 3.0
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                model.update_teacher()
 
-            tr_loss += loss.item() * grad_accum
+            ep_loss += loss.item() * grad_accum
 
-            if step % 50 == 0:
-                pbar.set_postfix(loss=f"{loss.item()*grad_accum:.4f}", gpu=gpu_mem())
+            if step % 20 == 0:
+                mem = torch.cuda.memory_allocated()/1e9 if DEVICE.type=='cuda' else 0
+                pbar.set_postfix(
+                    loss=f"{loss.item()*grad_accum:.4f}",
+                    lr=f"{lr_schedule[epoch]:.2e}",
+                    gpu=f"{mem:.1f}GB"
+                )
 
-        # ── Validation ───────────────────────────────────────
-        model.eval()
-        va_loss = va_dice = 0.0
-        with torch.no_grad():
-            for img, seg in tqdm(val_loader, desc="  val", ncols=90, leave=False):
-                img = img.to(DEVICE, non_blocking=True)
-                seg = seg.to(DEVICE, non_blocking=True)
-                with autocast('cuda'):
-                    out  = model(img)
-                    loss = criterion(out, seg)
-                va_loss += loss.item()
-                va_dice += dice_score(out, seg)
+        avg = ep_loss / len(loader)
+        history.append(avg)
+        print(f"  Ep[{epoch+1}/{num_epochs}] Loss={avg:.4f} | "
+              f"LR={lr_schedule[epoch]:.2e} | m={model.momentum:.4f}")
 
-        atl = tr_loss / len(train_loader)
-        avl = va_loss / len(val_loader)
-        adc = va_dice / len(val_loader)
-        cur_lr = optimizer.param_groups[-1]['lr']
+        torch.save({
+            'epoch': epoch, 'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'best_loss': best_loss, 'history': history,
+        }, ckpt_path)
 
-        history['train_loss'].append(atl)
-        history['val_loss'].append(avl)
-        history['val_dice'].append(adc)
+        if avg < best_loss:
+            best_loss = avg
+            torch.save(model.teacher_encoder.state_dict(),
+                       cfg['output']['best_encoder'])
+            print(f"  ✓ Best teacher encoder saved (loss={best_loss:.4f})")
 
-        print(f"[{label[:4]}] Ep[{epoch+1}/{num_epochs}] "
-              f"Loss {atl:.4f}/{avl:.4f} | Dice {adc:.4f} | "
-              f"LR {cur_lr:.2e} | GPU {gpu_mem()}")
-
-        torch.save({'epoch': epoch, 'model': model.state_dict(),
-                    'best_dice': best_dice}, ckpt_path)
-
-        if adc > best_dice:
-            best_dice = adc
-            torch.save(model.state_dict(), cfg['output']['best_model'])
-            print(f"  ✓ Best model saved (Dice={best_dice:.4f})")
-
-    print(f"\n[{label}] Done!  Best Val Dice: {best_dice:.4f}")
-    plot_and_save(history, label, out_dir)
+    plt.figure(figsize=(10, 4))
+    plt.plot(history, marker='o', linewidth=2, markersize=4, color='steelblue')
+    plt.title('DINO Pretraining Loss')
+    plt.xlabel('Epoch'); plt.ylabel('Loss')
+    plt.grid(True, alpha=0.4); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, 'dino_loss.png'), dpi=150)
+    print(f"\n✓ Done!  Best loss: {best_loss:.4f}")
+    print(f"✓ Teacher encoder → {cfg['output']['best_encoder']}")
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--config',  required=True)
-    p.add_argument('--encoder', default=None)
+    p.add_argument('--config',  default='configs/dino.yaml')
     p.add_argument('--epochs',  type=int, default=None)
     p.add_argument('--batch',   type=int, default=None)
     p.add_argument('--workers', type=int, default=None)
-    p.add_argument('--accum',   type=int, default=None)
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
     cfg  = load_cfg(args.config)
-    if args.encoder: cfg['pretrain']['encoder_path'] = args.encoder
-    if args.epochs:  cfg['train']['num_epochs']      = args.epochs
-    if args.batch:   cfg['train']['batch_size']      = args.batch
-    if args.workers: cfg['train']['num_workers']     = args.workers
-    if args.accum:   cfg['train']['grad_accum']      = args.accum
+    if args.epochs:  cfg['train']['num_epochs']  = args.epochs
+    if args.batch:   cfg['train']['batch_size']  = args.batch
+    if args.workers: cfg['train']['num_workers'] = args.workers
     train(cfg)
