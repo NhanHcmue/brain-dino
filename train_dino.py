@@ -1,15 +1,7 @@
 """
 train_dino.py — DINO Self-Supervised Pretraining
 
-Usage:
-    python train_dino.py --config configs/dino.yaml
-
-Output: outputs/dino/best_encoder.pth  ← dùng cho train_seg.py
-
-Lưu ý:
-  - DINO teacher encoder thường tốt hơn student → lưu teacher
-  - Batch size 4-8 là đủ (DINO không cần large batch như SimCLR)
-  - 100-200 epochs là đủ cho BraTS với ConvNeXt-Tiny
+Cập nhật: hỗ trợ H5 dataset 1 kênh, thêm --in_channels / --channel_idx
 """
 
 import argparse
@@ -54,18 +46,21 @@ def log_system():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32       = True
     else:
-        print("GPU     : ✗ No CUDA!")
+        print("GPU     : CPU mode")
     print()
 
 
 def cosine_scheduler(base_val, final_val, epochs, warmup=10):
-    """Cosine schedule với warmup."""
+    epochs   = max(epochs, 1)
+    warmup   = min(warmup, epochs)
     schedule = np.ones(epochs) * base_val
     if warmup > 0:
         schedule[:warmup] = np.linspace(0, base_val, warmup)
-    t = np.arange(epochs - warmup)
-    schedule[warmup:] = final_val + 0.5 * (base_val - final_val) * \
-                        (1 + np.cos(np.pi * t / (epochs - warmup)))
+    remaining = epochs - warmup
+    if remaining > 0:
+        t = np.arange(remaining)
+        schedule[warmup:] = final_val + 0.5 * (base_val - final_val) * \
+                            (1 + np.cos(np.pi * t / remaining))
     return schedule
 
 
@@ -73,27 +68,39 @@ def train(cfg):
     out_dir = cfg['output']['dir']
     os.makedirs(out_dir, exist_ok=True)
 
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    DEVICE_TYPE = DEVICE.type
     log_system()
     set_seed(cfg['train']['seed'])
 
-    # ── Dataset ──
-    patch_dir = cfg['data']['patch_dir']
-    nw        = cfg['train']['num_workers']
-    bs        = cfg['train']['batch_size']
+    patch_dir   = cfg['data']['patch_dir']
+    nw          = cfg['train']['num_workers']
+    bs          = cfg['train']['batch_size']
+    in_channels = cfg['data'].get('in_channels', 1)
+    channel_idx = cfg['data'].get('channel_idx', 3)
+    val_split   = cfg['data'].get('val_split', 0.2)
+    ppv         = cfg['data'].get('patches_per_volume', 8)
 
-    dataset = PatchDataset(patch_dir, split='train', mode='ssl',
-                           ram_cache=cfg['data'].get('ram_cache', False))
+    dataset = PatchDataset(
+        patch_dir,
+        split='train',
+        mode='ssl',
+        ram_cache=cfg['data'].get('ram_cache', False),
+        in_channels=in_channels,
+        channel_idx=channel_idx,
+        val_split=val_split,
+        patches_per_volume=ppv,
+        seed=cfg['train']['seed'],
+    )
     loader  = DataLoader(
         dataset, batch_size=bs, shuffle=True,
-        num_workers=nw, pin_memory=True, drop_last=True,
-        persistent_workers=nw > 0,
+        num_workers=nw, pin_memory=(DEVICE_TYPE == 'cuda'), drop_last=True,
+        persistent_workers=(nw > 0),
         prefetch_factor=4 if nw > 0 else None,
     )
     print(f"Dataset : {len(dataset)} patches | {len(loader)} batches/epoch\n")
 
-    # ── Model ──
-    encoder    = ConvNeXtTiny3D(in_channels=4).to(DEVICE)
+    encoder    = ConvNeXtTiny3D(in_channels=in_channels).to(DEVICE)
     model      = DINO(encoder, feat_dim=768,
                       out_dim=cfg['dino']['out_dim'],
                       momentum=cfg['dino']['momentum']).to(DEVICE)
@@ -113,16 +120,14 @@ def train(cfg):
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.student_encoder.parameters())
-    print(f"Encoder : {n_params/1e6:.1f}M params")
+    print(f"Encoder : {n_params/1e6:.1f}M params | in_channels={in_channels}")
 
-    # ── Optimizer: AdamW với cosine LR ──
     num_epochs = cfg['train']['num_epochs']
     warmup_ep  = cfg['train'].get('warmup_epochs', 10)
-    base_lr    = cfg['optimizer']['base_lr'] * bs / 256  # linear scaling rule
+    base_lr    = cfg['optimizer']['base_lr'] * bs / 256
     min_lr     = cfg['optimizer']['min_lr']
     wd         = cfg['optimizer']['weight_decay']
 
-    # Separate params: no weight decay cho norm + bias
     decay_params    = [p for n, p in model.named_parameters()
                        if 'norm' not in n and 'bias' not in n
                        and 'gamma' not in n and p.requires_grad]
@@ -135,17 +140,12 @@ def train(cfg):
         {'params': no_decay_params, 'weight_decay': 0.0},
     ], lr=base_lr)
 
-    # LR schedule
-    lr_schedule = cosine_scheduler(base_lr, min_lr, num_epochs, warmup_ep)
-    # Momentum schedule: 0.996 → 1.0
-    mom_schedule = cosine_scheduler(
-        cfg['dino']['momentum'], 1.0, num_epochs, warmup=0
-    )
+    lr_schedule  = cosine_scheduler(base_lr, min_lr, num_epochs, warmup_ep)
+    mom_schedule = cosine_scheduler(cfg['dino']['momentum'], 1.0, num_epochs, warmup=0)
 
-    scaler     = GradScaler('cuda')
+    scaler     = GradScaler(DEVICE_TYPE) if DEVICE_TYPE == 'cuda' else None
     grad_accum = cfg['train'].get('grad_accum', 1)
 
-    # ── Resume ──
     start_epoch = 0; best_loss = float('inf'); history = []
     ckpt_path   = cfg['output']['checkpoint']
     if os.path.exists(ckpt_path):
@@ -159,15 +159,15 @@ def train(cfg):
         print(f"  epoch={start_epoch}, best_loss={best_loss:.4f}\n")
 
     print(f"{'─'*55}")
-    print(f"  DINO Pretraining — {num_epochs} epochs")
-    print(f"  batch={bs} | lr={base_lr:.2e} | momentum={cfg['dino']['momentum']}")
+    print(f"  DINO Pretraining — {num_epochs} epochs  [{DEVICE_TYPE.upper()}]")
+    print(f"  batch={bs} | lr={base_lr:.2e} | grad_accum={grad_accum}")
     print(f"{'─'*55}\n")
 
     for epoch in range(start_epoch, num_epochs):
-        # Update LR và momentum
+        sched_idx = min(epoch, len(lr_schedule) - 1)
         for g in optimizer.param_groups:
-            g['lr'] = lr_schedule[epoch]
-        model.momentum = mom_schedule[epoch]
+            g['lr'] = lr_schedule[sched_idx]
+        model.momentum = mom_schedule[sched_idx]
 
         model.train()
         ep_loss = 0.0
@@ -179,11 +179,10 @@ def train(cfg):
         for step, x in enumerate(pbar):
             x = x.to(DEVICE, non_blocking=True)
 
-            # Tạo multi-crop views trên GPU
             with torch.no_grad():
                 views = multi_crop(x)
 
-            with autocast('cuda'):
+            with autocast(DEVICE_TYPE, enabled=(DEVICE_TYPE == 'cuda')):
                 student_out, teacher_out = model(views)
                 loss = criterion(student_out, teacher_out, epoch) / grad_accum
 
@@ -192,38 +191,40 @@ def train(cfg):
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            scaler.scale(loss).backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
-                # Clip student gradients (quan trọng cho DINO stability)
-                scaler.unscale_(optimizer)
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 3.0
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-
-                # Update teacher EMA
                 model.update_teacher()
 
             ep_loss += loss.item() * grad_accum
 
             if step % 20 == 0:
-                mem = torch.cuda.memory_allocated()/1e9 if DEVICE.type=='cuda' else 0
+                mem = torch.cuda.memory_allocated()/1e9 if DEVICE_TYPE=='cuda' else 0
                 pbar.set_postfix(
                     loss=f"{loss.item()*grad_accum:.4f}",
-                    lr=f"{lr_schedule[epoch]:.2e}",
+                    lr=f"{lr_schedule[sched_idx]:.2e}",
                     gpu=f"{mem:.1f}GB"
                 )
 
         avg = ep_loss / len(loader)
         history.append(avg)
         print(f"  Ep[{epoch+1}/{num_epochs}] Loss={avg:.4f} | "
-              f"LR={lr_schedule[epoch]:.2e} | "
-              f"m={model.momentum:.4f}")
+              f"LR={lr_schedule[sched_idx]:.2e} | m={model.momentum:.4f}")
 
-        # Checkpoint
         torch.save({
             'epoch': epoch, 'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -232,14 +233,10 @@ def train(cfg):
 
         if avg < best_loss:
             best_loss = avg
-            # Lưu TEACHER encoder (thường tốt hơn student)
-            torch.save(
-                model.teacher_encoder.state_dict(),
-                cfg['output']['best_encoder']
-            )
+            torch.save(model.teacher_encoder.state_dict(),
+                       cfg['output']['best_encoder'])
             print(f"  ✓ Best teacher encoder saved (loss={best_loss:.4f})")
 
-    # Plot loss
     plt.figure(figsize=(10, 4))
     plt.plot(history, marker='o', linewidth=2, markersize=4, color='steelblue')
     plt.title('DINO Pretraining Loss')
@@ -252,17 +249,26 @@ def train(cfg):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--config',  default='configs/dino.yaml')
-    p.add_argument('--epochs',  type=int, default=None)
-    p.add_argument('--batch',   type=int, default=None)
-    p.add_argument('--workers', type=int, default=None)
+    p.add_argument('--config',      default='configs/dino.yaml')
+    p.add_argument('--epochs',      type=int, default=None)
+    p.add_argument('--batch',       type=int, default=None)
+    p.add_argument('--workers',     type=int, default=None)
+    p.add_argument('--patch_dir',   default=None)
+    p.add_argument('--in_channels', type=int, default=None,
+                   help='Số kênh input: 1 (flair) hoặc 4 (tất cả modalities)')
+    p.add_argument('--channel_idx', type=int, default=None,
+                   help='Kênh dùng khi in_channels=1 (0=t1,1=t1ce,2=t2,3=flair)')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
     cfg  = load_cfg(args.config)
-    if args.epochs:  cfg['train']['num_epochs']  = args.epochs
-    if args.batch:   cfg['train']['batch_size']  = args.batch
-    if args.workers: cfg['train']['num_workers'] = args.workers
+    if args.epochs:      cfg['train']['num_epochs']     = args.epochs
+    if args.batch:       cfg['train']['batch_size']     = args.batch
+    if args.workers:     cfg['train']['num_workers']    = args.workers
+    if args.patch_dir:   cfg['data']['patch_dir']       = args.patch_dir
+    if args.in_channels: cfg['data']['in_channels']     = args.in_channels
+    if args.channel_idx is not None:
+                         cfg['data']['channel_idx']     = args.channel_idx
     train(cfg)

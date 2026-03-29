@@ -1,193 +1,136 @@
 """
-src/dino.py — DINO Self-Supervised Pretraining
+src/models.py — ConvNeXtNNUNet: ConvNeXt-Tiny 3D Encoder + nnU-Net Decoder
 
-Tại sao DINO tốt hơn SimCLR cho medical imaging?
-  1. Không cần large batch (SimCLR cần 256+, DINO ổn với 8-16)
-  2. Self-distillation: teacher centering ngăn collapse không cần negatives
-  3. Multi-crop: học từ local-global consistency → tốt cho tumor nhỏ
-  4. Representations tốt hơn cho dense prediction (segmentation)
-     — đã chứng minh trong DINO paper và nhiều medical imaging benchmark
-
-Architecture:
-  Student: ConvNeXtTiny3D + DINOHead (được update bằng gradient)
-  Teacher: EMA copy của student     (được update bằng momentum)
-  
-  Loss = cross_entropy(student_softmax, teacher_softmax_centered)
+LỖI ĐÃ SỬA: File cũ chứa nội dung của dino.py (copy nhầm).
+             File này phải chứa ConvNeXtNNUNet để train_seg.py import được.
 """
 
-import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DINOHead(nn.Module):
-    """
-    3-layer MLP với weight-normalized last layer.
-    Output: logits để so sánh student-teacher (không normalize thành prob ở đây).
-    """
+class nnUNetConvBlock(nn.Module):
+    """Double Conv + InstanceNorm + LeakyReLU với residual shortcut."""
 
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int = 65536,
-        hidden_dim: int = 2048,
-        bottleneck_dim: int = 256,
-        n_layers: int = 3,
-    ):
+    def __init__(self, in_ch: int, out_ch: int, p_dropout: float = 0.0):
         super().__init__()
-        layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
-        for _ in range(n_layers - 2):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
-        layers.append(nn.Linear(hidden_dim, bottleneck_dim))
-        self.mlp = nn.Sequential(*layers)
-
-        # Weight-norm last layer — không cần BN, ổn định hơn
-        self.last = nn.utils.weight_norm(
-            nn.Linear(bottleneck_dim, out_dim, bias=False)
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout3d(p_dropout) if p_dropout > 0 else nn.Identity(),
+            nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
         )
-        self.last.weight_g.data.fill_(1)
-        self.last.weight_g.requires_grad = False  # freeze norm coefficient
+        self.skip = nn.Conv3d(in_ch, out_ch, 1, bias=False) \
+                    if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
-        return self.last(x)
+        return self.conv(x) + self.skip(x)
 
 
-class DINOLoss(nn.Module):
+class DecoderBlock(nn.Module):
+    """Upsample 2× → concat skip → nnUNetConvBlock."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.up   = nn.ConvTranspose3d(in_ch, in_ch, kernel_size=2, stride=2)
+        self.conv = nnUNetConvBlock(in_ch + skip_ch, out_ch)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:],
+                              mode='trilinear', align_corners=False)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
+class ConvNeXtNNUNet(nn.Module):
     """
-    DINO loss với centering và sharpening.
-    
-    - Teacher output được center (trừ running mean) → ngăn collapse
-    - Student output được sharpen (chia temp thấp)
-    - Loss = H(teacher_soft, student_soft) trên tất cả cặp global-* views
+    ConvNeXt-Tiny 3D Encoder + nnU-Net Style Decoder.
+
+    Encoder skips từ ConvNeXtTiny3D: [96@D/4, 192@D/8, 384@D/16, 768@D/32]
+
+    Decoder:
+      Bottleneck: 768ch → 768ch
+      dec3: up + cat(384) → 384ch
+      dec2: up + cat(192) → 192ch
+      dec1: up + cat(96)  → 96ch
+      up×4 (stem stride=4) → input size
+      head 1×1 → num_classes
+
+    Deep supervision (training only):
+      ds3, ds2, ds1 → upsample về input size
+      Loss weights: 1.0, 0.4, 0.2, 0.1
     """
+
+    ENC_CHANNELS = [96, 192, 384, 768]
 
     def __init__(
         self,
-        out_dim: int = 65536,
-        n_global_crops: int = 2,
-        warmup_teacher_temp: float = 0.04,
-        teacher_temp: float = 0.04,
-        warmup_teacher_temp_epochs: int = 30,
-        student_temp: float = 0.1,
-        center_momentum: float = 0.9,
+        encoder,
+        num_classes: int = 1,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        self.student_temp = student_temp
-        self.center_momentum = center_momentum
-        self.n_global_crops  = n_global_crops
-        self.register_buffer('center', torch.zeros(1, out_dim))
+        self.encoder = encoder
+        ch = self.ENC_CHANNELS
 
-        # Teacher temp warmup schedule
-        self.teacher_temp_schedule = torch.cat([
-            torch.linspace(warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs),
-            torch.ones(1000) * teacher_temp,
-        ])
+        self.bottleneck = nnUNetConvBlock(ch[3], ch[3], p_dropout=dropout)
 
-    def forward(self, student_out, teacher_out, epoch: int):
-        """
-        student_out: list of (B, out_dim), len = n_views
-        teacher_out: list of (B, out_dim), len = n_global_crops only
-        """
-        t_temp = self.teacher_temp_schedule[epoch].item()
+        self.dec3 = DecoderBlock(ch[3], ch[2], ch[2])
+        self.dec2 = DecoderBlock(ch[2], ch[1], ch[1])
+        self.dec1 = DecoderBlock(ch[1], ch[0], ch[0])
 
-        # Teacher: center + sharpen
-        teacher_probs = [
-            F.softmax((t - self.center) / t_temp, dim=-1).detach()
-            for t in teacher_out
-        ]
+        # Upsample ×4 để về kích thước input (stem đã stride 4)
+        self.up_final = nn.Sequential(
+            nn.ConvTranspose3d(ch[0], 32, kernel_size=2, stride=2),
+            nn.InstanceNorm3d(32, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.ConvTranspose3d(32, 16, kernel_size=2, stride=2),
+            nn.InstanceNorm3d(16, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
+        )
+        self.head = nn.Conv3d(16, num_classes, kernel_size=1)
 
-        # Student: sharpen
-        student_log = [
-            F.log_softmax(s / self.student_temp, dim=-1)
-            for s in student_out
-        ]
+        # Deep supervision heads
+        self.ds3 = nn.Conv3d(ch[2], num_classes, kernel_size=1)
+        self.ds2 = nn.Conv3d(ch[1], num_classes, kernel_size=1)
+        self.ds1 = nn.Conv3d(ch[0], num_classes, kernel_size=1)
 
-        loss = 0.0; n_pairs = 0
-        for t_idx, t_soft in enumerate(teacher_probs):
-            for s_idx, s_log in enumerate(student_log):
-                if s_idx == t_idx:
-                    continue  # bỏ qua cặp giống nhau
-                loss -= (t_soft * s_log).sum(dim=-1).mean()
-                n_pairs += 1
+        self._init_weights()
 
-        loss = loss / max(1, n_pairs)
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out',
+                                        nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-        # Update center (EMA của teacher outputs)
-        with torch.no_grad():
-            batch_center = torch.cat(teacher_out).mean(dim=0, keepdim=True)
-            self.center  = self.center * self.center_momentum + \
-                           batch_center * (1 - self.center_momentum)
+    def forward(self, x: torch.Tensor):
+        input_size = x.shape[2:]
 
-        return loss
+        skips = self.encoder(x)          # [96ch, 192ch, 384ch, 768ch]
+        s0, s1, s2, s3 = skips
 
+        b  = self.bottleneck(s3)         # 768ch
 
-class DINO(nn.Module):
-    """
-    Full DINO model:
-      student_encoder + student_head
-      teacher_encoder + teacher_head (EMA, no grad)
-    
-    Sau khi train xong, chỉ dùng teacher_encoder.state_dict()
-    vì teacher thường có representation tốt hơn student.
-    """
+        d3 = self.dec3(b,  s2)           # 384ch
+        d2 = self.dec2(d3, s1)           # 192ch
+        d1 = self.dec1(d2, s0)           # 96ch
 
-    def __init__(
-        self,
-        encoder,               # ConvNeXtTiny3D
-        feat_dim: int = 768,
-        out_dim: int = 65536,
-        momentum: float = 0.996,
-    ):
-        super().__init__()
-        self.student_encoder = encoder
-        self.teacher_encoder = copy.deepcopy(encoder)
+        out = self.head(self.up_final(d1))  # → input_size
 
-        self.student_head = DINOHead(feat_dim, out_dim)
-        self.teacher_head = DINOHead(feat_dim, out_dim)
+        if self.training:
+            ds3 = F.interpolate(self.ds3(d3), size=input_size,
+                                mode='trilinear', align_corners=False)
+            ds2 = F.interpolate(self.ds2(d2), size=input_size,
+                                mode='trilinear', align_corners=False)
+            ds1 = F.interpolate(self.ds1(d1), size=input_size,
+                                mode='trilinear', align_corners=False)
+            return out, ds3, ds2, ds1
 
-        # Teacher không train bằng gradient
-        for p in self.teacher_encoder.parameters():
-            p.requires_grad = False
-        for p in self.teacher_head.parameters():
-            p.requires_grad = False
-
-        # Copy weights từ student sang teacher
-        self.teacher_encoder.load_state_dict(encoder.state_dict())
-        self.teacher_head.load_state_dict(self.student_head.state_dict())
-
-        self.momentum = momentum
-
-    @torch.no_grad()
-    def update_teacher(self):
-        """EMA update: teacher = m*teacher + (1-m)*student."""
-        for s, t in zip(self.student_encoder.parameters(),
-                        self.teacher_encoder.parameters()):
-            t.data = t.data * self.momentum + s.data * (1.0 - self.momentum)
-        for s, t in zip(self.student_head.parameters(),
-                        self.teacher_head.parameters()):
-            t.data = t.data * self.momentum + s.data * (1.0 - self.momentum)
-
-    def forward(self, views):
-        """
-        views: list [global_1, global_2, local_1, ..., local_n]
-        Returns: (student_outputs, teacher_outputs)
-        """
-        global_views = views[:2]
-
-        # Student: process ALL views
-        student_out = [
-            self.student_head(self.student_encoder.forward_flat(v))
-            for v in views
-        ]
-
-        # Teacher: process global views only (no_grad já setado nos params)
-        with torch.no_grad():
-            teacher_out = [
-                self.teacher_head(self.teacher_encoder.forward_flat(v))
-                for v in global_views
-            ]
-
-        return student_out, teacher_out
+        return out

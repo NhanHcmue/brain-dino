@@ -1,12 +1,17 @@
 # ============================================================
 # Config: Segmentation — Baseline (Random Init)
-# ⚠ Mọi thứ giống seg_pretrained.yaml trừ encoder_path + output dir
+# Đọc H5 trực tiếp, 1 kênh (flair)
 # ============================================================
 
 # ── Data ──
 data:
-  patch_dir:  "data/brats_patches"
-  ram_cache:  false
+  patch_dir:          "data/brats_h5"
+  in_channels:        1
+  channel_idx:        3
+  val_split:          0.2
+  patches_per_volume: 8
+  patch_size: 96              # volume là 134x172x136 → patch 96 vừa đủ
+  ram_cache:          false
 
 # ── Không có pretrained encoder ──
 pretrain:
@@ -18,23 +23,20 @@ output:
   checkpoint: "outputs/seg_baseline/checkpoint.pth"
   best_model: "outputs/seg_baseline/best_model.pth"
 
-# ── Training (PHẢI GIỐNG pretrained) ──
+# ── Training (GIỐNG pretrained để so sánh công bằng) ──
 train:
   batch_size:  2
   num_epochs:  200
-  num_workers: 8
-  seed:        42     # ⚠ cùng seed = cùng data split = fair comparison
+  num_workers: 4
+  seed:        42
   grad_accum:  4
 
-# ── Không freeze (không có encoder tốt để preserve) ──
-# finetune: không có
-
-# ── Optimizer (GIỐNG pretrained) ──
+# ── Optimizer ──
 optimizer:
   lr:           2.0e-4
   weight_decay: 1.0e-4
 
-# ── GPU Augmentation (GIỐNG pretrained) ──
+# ── GPU Augmentation ──
 augmentation:
   p_flip:      0.5
   p_noise:     0.5

@@ -1,23 +1,7 @@
 """
 train_seg.py — Segmentation Training (Pretrained DINO + Baseline)
 
-Usage:
-    # DINO pretrained (mô hình chính):
-    python train_seg.py --config configs/seg_pretrained.yaml
-
-    # Baseline (random init để so sánh):
-    python train_seg.py --config configs/seg_baseline.yaml
-
-    # Override từ CLI:
-    python train_seg.py --config configs/seg_pretrained.yaml --batch 4 --workers 8
-
-Training strategy (pretrained):
-    Phase 1 (epoch 0-19):   Freeze encoder, chỉ train decoder
-    Phase 2 (epoch 20+):    Unfreeze encoder, lr_encoder = lr × 0.01
-    
-    Lý do 2-phase:
-      - Decoder initialized randomly → cần ổn định trước
-      - Nếu unfreeze ngay, strong DINO encoder bị "corrupted"
+Cập nhật: hỗ trợ H5 dataset 1 kênh, thêm --in_channels / --channel_idx
 """
 
 import argparse
@@ -54,12 +38,12 @@ def load_cfg(path):
         return yaml.safe_load(f)
 
 
-def gpu_mem():
-    if torch.cuda.is_available():
+def gpu_mem(device_type):
+    if device_type == 'cuda' and torch.cuda.is_available():
         u = torch.cuda.memory_allocated() / 1e9
         t = torch.cuda.get_device_properties(0).total_memory / 1e9
         return f"{u:.1f}/{t:.0f}GB"
-    return "N/A"
+    return "CPU"
 
 
 def log_system():
@@ -71,12 +55,11 @@ def log_system():
         torch.backends.cudnn.allow_tf32       = True
         print(f"TF32    : enabled")
     else:
-        print("GPU     : ✗ No CUDA!")
+        print("GPU     : CPU mode")
     print()
 
 
 def make_optimizer(model, lr, wd, encoder_path, enc_lr_scale):
-    """Tạo optimizer với lr khác nhau cho encoder và decoder."""
     if encoder_path:
         enc_params = [p for n, p in model.named_parameters()
                       if 'encoder' in n and p.requires_grad]
@@ -93,11 +76,12 @@ def make_optimizer(model, lr, wd, encoder_path, enc_lr_scale):
 
 
 def cosine_lr(optimizer, epoch, num_epochs, warmup=5, base_lr=2e-4, min_lr=1e-6):
-    if epoch < warmup:
-        factor = (epoch + 1) / warmup
+    eff_epoch = min(epoch, num_epochs - 1)
+    if eff_epoch < warmup:
+        factor = (eff_epoch + 1) / max(1, warmup)
     else:
         factor = min_lr / base_lr + 0.5 * (1 - min_lr / base_lr) * \
-                 (1 + np.cos(np.pi * (epoch - warmup) / (num_epochs - warmup)))
+                 (1 + np.cos(np.pi * (eff_epoch - warmup) / max(1, num_epochs - warmup)))
     for g in optimizer.param_groups:
         g['lr'] = g.get('initial_lr', base_lr) * factor
 
@@ -126,7 +110,8 @@ def train(cfg):
     out_dir = cfg['output']['dir']
     os.makedirs(out_dir, exist_ok=True)
 
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    DEVICE_TYPE = DEVICE.type
     log_system()
     set_seed(cfg['train']['seed'])
 
@@ -134,49 +119,60 @@ def train(cfg):
     label        = 'DINO-Pretrained' if encoder_path else 'Baseline'
     print(f"Mode: {label}\n")
 
-    # ── Dataset ──
-    patch_dir = cfg['data']['patch_dir']
-    nw        = cfg['train']['num_workers']
-    bs        = cfg['train']['batch_size']
-    ram_cache = cfg['data'].get('ram_cache', False)
+    patch_dir   = cfg['data']['patch_dir']
+    nw          = cfg['train']['num_workers']
+    bs          = cfg['train']['batch_size']
+    in_channels = cfg['data'].get('in_channels', 1)
+    channel_idx = cfg['data'].get('channel_idx', 3)
+    val_split   = cfg['data'].get('val_split', 0.2)
+    ppv         = cfg['data'].get('patches_per_volume', 8)
+    ram_cache   = cfg['data'].get('ram_cache', False)
 
-    train_ds = PatchDataset(patch_dir, 'train', mode='seg', ram_cache=ram_cache)
-    val_ds   = PatchDataset(patch_dir, 'val',   mode='seg', ram_cache=False)
+    # Dataset kwargs chung
+    ds_kwargs = dict(
+        in_channels=in_channels,
+        channel_idx=channel_idx,
+        val_split=val_split,
+        patches_per_volume=ppv,
+        seed=cfg['train']['seed'],
+    )
+
+    train_ds = PatchDataset(patch_dir, 'train', mode='seg',
+                            ram_cache=ram_cache, **ds_kwargs)
+    val_ds   = PatchDataset(patch_dir, 'val',   mode='seg',
+                            ram_cache=False, **ds_kwargs)
 
     train_loader = DataLoader(
         train_ds, bs, shuffle=True,
-        num_workers=nw, pin_memory=True, drop_last=True,
-        persistent_workers=nw > 0,
+        num_workers=nw, pin_memory=(DEVICE_TYPE == 'cuda'), drop_last=True,
+        persistent_workers=(nw > 0),
         prefetch_factor=4 if nw > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, bs, shuffle=False,
-        num_workers=max(1, nw // 2), pin_memory=True,
-        persistent_workers=nw > 0,
+        num_workers=max(1, nw // 2), pin_memory=(DEVICE_TYPE == 'cuda'),
+        persistent_workers=(nw > 0),
         prefetch_factor=2 if nw > 0 else None,
     )
     print(f"Train: {len(train_ds)} patches | Val: {len(val_ds)} patches")
     print(f"Loaders: {len(train_loader)} train | {len(val_loader)} val\n")
 
-    # ── Model ──
-    encoder = ConvNeXtTiny3D(in_channels=4).to(DEVICE)
+    encoder = ConvNeXtTiny3D(in_channels=in_channels).to(DEVICE)
+    print(f"ConvNeXtTiny3D: in_channels={in_channels}")
 
     if encoder_path:
         assert os.path.exists(encoder_path), f"Encoder not found: {encoder_path}"
         state = torch.load(encoder_path, map_location=DEVICE, weights_only=True)
         missing, unexpected = encoder.load_state_dict(state, strict=False)
         print(f"✓ Loaded DINO encoder: {encoder_path}")
-        if missing:
-            print(f"  Missing keys: {len(missing)}")
-        if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
+        if missing:    print(f"  Missing keys   : {len(missing)}")
+        if unexpected: print(f"  Unexpected keys: {len(unexpected)}")
     else:
         print("[BASELINE] Random init encoder")
 
     model = ConvNeXtNNUNet(encoder, num_classes=1).to(DEVICE)
 
-    # torch.compile nếu có (PyTorch 2.0+)
-    if hasattr(torch, 'compile') and torch.cuda.is_available():
+    if hasattr(torch, 'compile') and DEVICE_TYPE == 'cuda':
         try:
             model = torch.compile(model, mode='reduce-overhead')
             print("✓ torch.compile enabled")
@@ -184,12 +180,12 @@ def train(cfg):
             pass
 
     total = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Model: {total:.1f}M params | GPU: {gpu_mem()}\n")
+    print(f"Model: {total:.1f}M params | GPU: {gpu_mem(DEVICE_TYPE)}\n")
 
-    # ── Training setup ──
     gpu_aug    = GPUAugmentation3D(**cfg['augmentation']).to(DEVICE)
     criterion  = CombinedSegLoss()
-    scaler     = GradScaler('cuda')
+
+    scaler     = GradScaler(DEVICE_TYPE) if DEVICE_TYPE == 'cuda' else None
     grad_accum = cfg['train'].get('grad_accum', 1)
     num_epochs = cfg['train']['num_epochs']
     base_lr    = cfg['optimizer']['lr']
@@ -199,23 +195,25 @@ def train(cfg):
     enc_scale  = cfg.get('finetune', {}).get('encoder_lr_scale', 0.01) \
                  if encoder_path else 1.0
 
-    # Phase 1: freeze encoder
     if freeze_ep > 0:
         for p in model.encoder.parameters():
             p.requires_grad = False
         print(f"Phase 1: encoder frozen for {freeze_ep} epochs\n")
 
     optimizer = make_optimizer(model, base_lr, wd, encoder_path, enc_scale)
-    # Store initial lr cho cosine scheduler
     for g in optimizer.param_groups:
         g['initial_lr'] = g['lr']
 
-    # ── Resume ──
     start_epoch = 0; best_dice = 0.0
     ckpt_path   = cfg['output']['checkpoint']
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt['model'])
+        if 'optimizer' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            except Exception:
+                pass
         start_epoch = ckpt['epoch'] + 1
         best_dice   = ckpt.get('best_dice', 0.0)
         print(f"Resumed epoch {start_epoch}, best_dice={best_dice:.4f}\n")
@@ -223,14 +221,12 @@ def train(cfg):
     history = {'train_loss': [], 'val_loss': [], 'val_dice': []}
 
     print(f"{'─'*60}")
-    print(f"  Segmentation [{label}] — {num_epochs} epochs")
-    print(f"  batch={bs} | grad_accum={grad_accum} | "
-          f"effective_batch={bs*grad_accum}")
+    print(f"  Segmentation [{label}] — {num_epochs} epochs  [{DEVICE_TYPE.upper()}]")
+    print(f"  batch={bs} | grad_accum={grad_accum} | eff_batch={bs*grad_accum}")
     print(f"{'─'*60}\n")
 
     for epoch in range(start_epoch, num_epochs):
 
-        # Phase 2: unfreeze encoder
         if epoch == freeze_ep and freeze_ep > 0:
             for p in model.encoder.parameters():
                 p.requires_grad = True
@@ -239,11 +235,9 @@ def train(cfg):
                 g['initial_lr'] = g['lr']
             print(f"\n[Phase 2] Encoder unfrozen at epoch {epoch+1}\n")
 
-        # LR update
-        cosine_lr(optimizer, epoch, num_epochs,
-                  warmup=5, base_lr=base_lr, min_lr=1e-6)
+        cosine_lr(optimizer, epoch, num_epochs, warmup=5,
+                  base_lr=base_lr, min_lr=1e-6)
 
-        # ── Train ──
         model.train()
         tr_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
@@ -261,7 +255,7 @@ def train(cfg):
             with torch.no_grad():
                 img = gpu_aug(img)
 
-            with autocast('cuda'):
+            with autocast(DEVICE_TYPE, enabled=(DEVICE_TYPE == 'cuda')):
                 out  = model(img)
                 loss = criterion(out, seg) / grad_accum
 
@@ -270,13 +264,20 @@ def train(cfg):
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            scaler.scale(loss).backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
             tr_loss += loss.item() * grad_accum
@@ -284,18 +285,16 @@ def train(cfg):
             if step % 50 == 0:
                 pbar.set_postfix(
                     loss=f"{loss.item()*grad_accum:.4f}",
-                    gpu=gpu_mem(),
+                    gpu=gpu_mem(DEVICE_TYPE),
                 )
 
-        # ── Validation ──
         model.eval()
         va_loss = va_dice = 0.0
         with torch.no_grad():
-            for img, seg in tqdm(val_loader, desc="  val",
-                                 ncols=85, leave=False):
+            for img, seg in tqdm(val_loader, desc="  val", ncols=85, leave=False):
                 img = img.to(DEVICE, non_blocking=True)
                 seg = seg.to(DEVICE, non_blocking=True)
-                with autocast('cuda'):
+                with autocast(DEVICE_TYPE, enabled=(DEVICE_TYPE == 'cuda')):
                     out  = model(img)
                     loss = criterion(out, seg)
                 va_loss += loss.item()
@@ -304,8 +303,8 @@ def train(cfg):
         atl = tr_loss / len(train_loader)
         avl = va_loss / len(val_loader)
         adc = va_dice / len(val_loader)
-
         cur_lr = optimizer.param_groups[-1]['lr']
+
         history['train_loss'].append(atl)
         history['val_loss'].append(avl)
         history['val_dice'].append(adc)
@@ -315,13 +314,15 @@ def train(cfg):
             f"Loss {atl:.4f}/{avl:.4f} | "
             f"Dice {adc:.4f} | "
             f"LR {cur_lr:.2e} | "
-            f"GPU {gpu_mem()}"
+            f"{gpu_mem(DEVICE_TYPE)}"
         )
 
-        # Checkpoint
         torch.save({
-            'epoch': epoch, 'model': model.state_dict(),
+            'epoch':     epoch,
+            'model':     model.state_dict(),
+            'optimizer': optimizer.state_dict(),
             'best_dice': best_dice,
+            'history':   history,
         }, ckpt_path)
 
         if adc > best_dice:
@@ -335,21 +336,28 @@ def train(cfg):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--config',  required=True)
-    p.add_argument('--encoder', default=None)
-    p.add_argument('--epochs',  type=int, default=None)
-    p.add_argument('--batch',   type=int, default=None)
-    p.add_argument('--workers', type=int, default=None)
-    p.add_argument('--accum',   type=int, default=None)
+    p.add_argument('--config',      required=True)
+    p.add_argument('--encoder',     default=None)
+    p.add_argument('--epochs',      type=int, default=None)
+    p.add_argument('--batch',       type=int, default=None)
+    p.add_argument('--workers',     type=int, default=None)
+    p.add_argument('--accum',       type=int, default=None)
+    p.add_argument('--patch_dir',   default=None)
+    p.add_argument('--in_channels', type=int, default=None)
+    p.add_argument('--channel_idx', type=int, default=None)
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
     cfg  = load_cfg(args.config)
-    if args.encoder: cfg['pretrain']['encoder_path'] = args.encoder
-    if args.epochs:  cfg['train']['num_epochs']      = args.epochs
-    if args.batch:   cfg['train']['batch_size']      = args.batch
-    if args.workers: cfg['train']['num_workers']     = args.workers
-    if args.accum:   cfg['train']['grad_accum']      = args.accum
+    if args.encoder:     cfg['pretrain']['encoder_path'] = args.encoder
+    if args.epochs:      cfg['train']['num_epochs']      = args.epochs
+    if args.batch:       cfg['train']['batch_size']      = args.batch
+    if args.workers:     cfg['train']['num_workers']     = args.workers
+    if args.accum:       cfg['train']['grad_accum']      = args.accum
+    if args.patch_dir:   cfg['data']['patch_dir']        = args.patch_dir
+    if args.in_channels: cfg['data']['in_channels']      = args.in_channels
+    if args.channel_idx is not None:
+                         cfg['data']['channel_idx']      = args.channel_idx
     train(cfg)
